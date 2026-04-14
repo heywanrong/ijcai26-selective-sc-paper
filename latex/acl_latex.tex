@@ -767,19 +767,21 @@ Five caveats qualify the scope of our findings. First, we ran
 each cell with a single random seed. Pooled $n{=}400$ tightens
 skip-rate CIs to $\pm 3$\,pt but retention CIs remain wide
 because the denominator $\alpha_\mathrm{sc}$ is itself small;
-three seeds would tighten retention further. Second, we evaluate
-two model families and two math benchmarks; generalisation to
-coding, commonsense, retrieval-heavy tasks, or models in the
-$3$\,B$+$ range is not tested. Third, we fix $N{=}5$. At larger
+three seeds would tighten retention further. Second, both families
+are general-purpose instruct models, whose noisy prompt-induced CoT
+likely drives the high harm rate; RL-distilled reasoners
+(e.g.\ DeepSeek-R1-Distill-1.5B~\citep{DeepSeekR1}) should
+concentrate the correct mode and shrink $\mathbb{E}[h]$, which we
+did not test. Generalisation to coding, commonsense, or $3$\,B$+$ models is
+also untested. Third, we fix $N{=}5$. At larger
 $N$ the harm rate $\mathbb{E}[h]$ should fall (and the gate's
 threshold will need re-tuning), but the qualitative claim --- that
 $\mathbb{E}[h]$ is non-negligible --- should remain. Fourth, our
 gate uses a single fixed threshold $\tau^{\star}$; a
 difficulty-bucketed adaptive $\tau$ is an obvious extension.
-Finally, we do not study a cheap verifier post-SC; if one is
-available the right analysis is a three-way gate
-(greedy / SC / SC + verifier), which we leave to future work and
-which composes cleanly with the two-way gate studied here.
+Finally, we do not study a cheap post-SC verifier; with one, the
+right analysis is a three-way gate (greedy / SC / SC + verifier),
+which composes cleanly with our two-way gate.
 
 \section{Conclusion}
 
