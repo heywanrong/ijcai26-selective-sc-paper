@@ -1,0 +1,18 @@
+# LaTeX artifacts
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.fls
+*.fdb_latexmk
+*.pdf
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*~
