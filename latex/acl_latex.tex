@@ -20,7 +20,7 @@
 
 \graphicspath{{figures/}}
 
-\title{Selective Self-Consistency: A Confidence Gate for Test-Time Compute on Small Reasoning Models}
+\title{Selective Self-Consistency: A Confidence Gate for Prompted Chain-of-Thought on Small Instruct Language Models}
 
 \author{Anonymous Submission \\
   IJCAI-2026 Workshop on \\
@@ -31,35 +31,35 @@
 \maketitle
 
 \begin{abstract}
-Self-consistency (SC)~\citep{Wang2023SC} --- sampling $N$ reasoning
-traces and plurality-voting --- is the dominant test-time compute
-(TTC) method for chain-of-thought (CoT)
-reasoning~\citep{Wei2022CoT} and is almost always deployed as an
-unconditional \emph{always-SC} policy.
-We show that on small ($<2$B) reasoning models this policy is
-strictly dominated. Across two open models (Qwen-2.5-0.5B,
-Gemma-3-1B) in FP16 and MLX-Q4, on GSM8K and MATH-500, we run 8
-per-task cells and 4 task-pooled aggregates at $n{=}200$--$400$ per
-cell with $1\,000{\times}$ paired-bootstrap confidence intervals. In
-all $12/12$ experiments, an oracle gate that decides per-prompt
-whether to invoke SC attains $109$--$174\%$ of always-SC's accuracy at
-$23$--$30\%$ of its compute. The mechanism is simple: for small
-models, SC flips \emph{correct greedy answers to wrong} at a rate
-comparable to --- and on one cell exceeding --- the rate at which it
-flips wrong to right; on Qwen-Q4${\times}$MATH-500, always-SC is
-$3$\,pt \emph{worse} than always-greedy. A 12-feature logistic gate
-trained on a few hundred calibration prompts skips $45$--$99\%$ of
-SC calls and cuts always-SC compute by $36$--$79\%$ at $\ge 98\%$
-accuracy retention; a single-feature confidence gate achieves
-comparable savings on the easier cells. All
-experiments run on a single MacBook M4 Pro using
-MLX~\citep{MLX2024}; no CUDA, no cloud inference.
+We study prompted chain-of-thought (CoT) with self-consistency
+(SC) --- sampling $N$ traces and plurality-voting --- on
+small ($<2$B) \emph{instruct} language models, the regime where
+inference economics matter most and where always-SC is the
+inherited default. Native RL-trained reasoners are out of scope.
+We show that on this regime always-SC is strictly dominated.
+Across two open instruct models (Qwen-2.5-0.5B, Gemma-3-1B) in
+FP16 and MLX-Q4, on GSM8K and MATH-500, we run 8 per-task cells
+and 4 task-pooled aggregates at $n{=}200$--$400$ per cell with
+$1\,000{\times}$ paired-bootstrap confidence intervals. In all
+$12/12$ experiments, an oracle gate that decides per-prompt whether
+to invoke SC attains $109$--$174\%$ of always-SC's accuracy at
+$23$--$30\%$ of its compute. The mechanism is simple: for these
+models, prompted SC flips \emph{correct greedy answers to wrong}
+at a rate comparable to --- and on one cell exceeding --- the rate
+at which it flips wrong to right; on Qwen-Q4${\times}$MATH-500,
+always-SC is $3$\,pt \emph{worse} than always-greedy. A 12-feature
+logistic gate trained on a few hundred calibration prompts skips
+$45$--$99\%$ of SC calls and cuts always-SC compute by $36$--$79\%$
+at $\ge 98\%$ accuracy retention; a single-feature confidence gate
+achieves comparable savings on the easier cells. All experiments
+run on a single MacBook M4 Pro using MLX; no CUDA, no cloud
+inference.
 \end{abstract}
 
 \section{Introduction}
 
-Test-time compute (TTC) has become the workhorse of modern reasoning
-model deployment. Starting with chain-of-thought
+Test-time compute (TTC) has become the workhorse of modern
+language-model deployment. Starting with chain-of-thought
 prompting~\citep{Wei2022CoT,Kojima2022ZeroShotCoT}, a family of TTC
 methods --- self-consistency sampling~\citep{Wang2023SC}, best-of-$N$
 reranking with learned verifiers~\citep{Cobbe2021Verifiers,
@@ -71,24 +71,25 @@ strongest open and proprietary
 systems~\citep{DeepSeekR1,OpenAIO1,Chen2025LongCoTSurvey}. The
 prevailing deployment recipe is simple: for every query, sample $N$
 traces and plurality-vote. This \emph{always-SC} policy is the
-default in every widely-used reasoning-model inference stack we are
+default in every widely-used inference stack we are
 aware of, and has been exhaustively validated on large
 ($\ge 7$B) models, where $N{=}5$ to $N{=}40$ reliably trades compute
 for accuracy~\citep{Chen2025LongCoTSurvey,Snell2024TTC}.
 
 The economics of TTC are very different for \textbf{small} ($<2$B)
-reasoning models. Small reasoning models are precisely the segment
+\emph{instruct} language models. This is precisely the segment
 where inference economics matter most: on-device deployment is
 constrained by memory and battery~\citep{Wang2025MNNLLM,
 Bsharat2025MobileMMLU}, cloud cost is dominated by
 latency~\citep{Cao2026PER}, privacy pressures favour local
 inference, and recent work has shown that distilled
-1--4B reasoning models can close a surprising fraction of the gap to
+1--4B language models can close a surprising fraction of the gap to
 $7$B$+$ teachers on math and code~\citep{Xu2025Phi4Mini,
 DeepSeekR1,Zhu2024EoTD,Wang2025EffCoT}. Yet the community has
 largely inherited the always-SC recipe from large-model practice
-without revisiting whether it is still the right default at this
-scale. At the same time, a parallel literature on efficient TTC has
+without revisiting whether it is still the right default for
+\emph{prompted} CoT on small instruct models --- as opposed to
+native RL-trained reasoners, which are out of our scope. At the same time, a parallel literature on efficient TTC has
 emerged: \citet{Aggarwal2023AdaptiveConsistency} and
 \citet{Wan2024RASC} show that \emph{sample-count} can be cut by
 dynamic stopping rules; \citet{Aghazadeh2025CGES, Kim2026ReASC}
@@ -141,8 +142,9 @@ between-model routing; we instead aggregate native greedy logits
 into a prompt-level score.
 
 \paragraph{Contributions.}
-(i) The first paired-bootstrap measurement of SC's ``helps vs.\
-hurts'' decomposition on small reasoning models, exhibiting a
+(i) The first paired-bootstrap measurement of prompted SC's
+``helps vs.\ hurts'' decomposition on small instruct language
+models, exhibiting a
 non-negligible and at one cell \emph{dominant} harm rate
 (\S\ref{sec:oracle}); (ii) a counter-narrative to the ``SC is free''
 assumption implicit in current TTC literature; (iii) a minimal
@@ -182,8 +184,8 @@ sampling-based TTC; \citet{Liu2026PETS} optimises cross-prompt budget
 allocation. All assume SC runs; our gate can compose orthogonally
 with any of them to also decide \emph{whether} to run SC.
 
-\paragraph{Small reasoning models and quantisation.}
-Distilled sub-2B reasoning models~\citep{Xu2025Phi4Mini,
+\paragraph{Small language models and quantisation.}
+Distilled sub-2B language models~\citep{Xu2025Phi4Mini,
 Zhu2024EoTD,Wang2025EffCoT,Kang2025T1,DeepSeekR1} make the
 small-language-model (small-LM) ${+}$ TTC axis practically relevant.
 \citet{RedHatQuant2024} report ``4-bit-for-free'' on 7B-class models
@@ -785,8 +787,9 @@ which composes cleanly with our two-way gate.
 
 \section{Conclusion}
 
-On small ($<2$B) reasoning models, the default ``always run SC''
-recipe is strictly dominated by a per-prompt oracle gate in every
+For prompted CoT + SC on small ($<2$B) instruct language models,
+the default ``always run SC'' recipe is strictly dominated by a
+per-prompt oracle gate in every
 one of our $12$ experiments. The dominance is closed-form: the
 oracle's margin over always-SC equals the rate at which SC flips
 correct greedy answers to wrong, and on small models that rate is
