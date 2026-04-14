@@ -211,14 +211,16 @@ Figure~\ref{fig:oracle} plots
 12 experiments (8 per-task $+$ 4 pooled). The line at 100\% marks
 always-SC.
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
-\includegraphics[width=\columnwidth]{fig1_oracle_retention.png}
+\includegraphics[width=0.92\textwidth]{fig1_oracle_retention.png}
 \caption{Oracle TTC-gate strictly dominates always-SC on 12/12
-experiments. The dashed line marks always-SC parity. Retention
-$\in[109\%,174\%]$ across all cells and datasets.}
+experiments (8 per-task $+$ 4 pooled). Crimson highlights the
+\textbf{Qwen-0.5B~/~Q4~$\times$~MATH-500} ``killer cell'' where always-SC
+is 74\,pt worse than oracle. Dashed line marks always-SC parity.
+Retention $\in [109\%, 174\%]$ across all cells and datasets.}
 \label{fig:oracle}
-\end{figure}
+\end{figure*}
 
 \begin{figure*}[t]
 \centering
@@ -304,12 +306,15 @@ the fixed $\tau$ for CIs.
 
 \begin{figure*}[t]
 \centering
-\includegraphics[width=\textwidth]{fig2_pareto_pooled.png}
-\caption{TTC-Gate Pareto curves, pooled GSM8K $+$ MATH-500
-($n{=}400$ per cell). Gold star: oracle; red $\times$: always-greedy;
-black $\times$: always-SC. Curves sweep $\tau$ across the (cost,
-retention) plane. Logistic (12 features) outperforms conf\_only on
-3/4 cells at pooled scale; MLP loses universally.}
+\includegraphics[width=0.85\textwidth]{fig2_pareto_pooled.png}
+\caption{TTC-Gate Pareto curves on the four pooled cells
+($n{=}400$ per cell). Each curve traces $\tau$ across the
+(cost~ratio, acc~retention) plane. Gold star: oracle upper bound;
+hollow circle: best operating point at retention~$\ge 98\%$.
+Italic labels mark always-greedy (cost $1{\times}$) and always-SC
+(cost $5{\times}$). \textsc{Logistic} (12 features) outperforms
+\textsc{conf\_only} on 3/4 cells at pooled scale; MLP loses
+universally.}
 \label{fig:pareto}
 \end{figure*}
 
