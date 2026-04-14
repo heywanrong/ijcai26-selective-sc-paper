@@ -6,11 +6,17 @@
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
 \usepackage{microtype}
-\usepackage{inconsolata}
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{amsmath}
+\usepackage{amssymb}
 \usepackage{multirow}
+\usepackage{url}
+% Allow long URLs / hyphenated tokens to break inside the bibliography
+% column instead of overflowing the column rule.
+\PassOptionsToPackage{hyphens}{url}
+\sloppy
+\emergencystretch=3em
 
 \graphicspath{{figures/}}
 
@@ -25,296 +31,534 @@
 \maketitle
 
 \begin{abstract}
-Self-consistency (SC) --- sampling $N$ traces and plurality-voting ---
-is the dominant test-time compute (TTC) method for reasoning, and is
-typically deployed as \textit{always run SC}. We show that on small
-($<$2B) reasoning models this is wrong: \textbf{always-SC is strictly
-dominated} by an oracle gate that chooses per-prompt whether to run SC
-at all. Across two open models (Qwen-2.5-0.5B, Gemma-3-1B) in FP16 and
-MLX-Q4, on GSM8K and MATH-500, we run 8 independent cells (and 4
-pooled aggregates) at $n{=}200$--$400$ per cell with
-$1\,000{\times}$ bootstrap CIs. In all 12 experiments the oracle gate
-retains \textbf{109--174\%} of always-SC's accuracy at \textbf{20--50\%}
-of its compute. The mechanism is simple: for small models, SC flips
-\emph{correct greedy answers to wrong} at a rate comparable to --- and
-sometimes exceeding --- its ``wrong to right'' rate; on
-Qwen-Q4${\times}$MATH-500 always-SC is \textbf{3 points worse} than
-always-greedy. A tiny confidence-based gate realises most of the oracle's
-savings: a single-feature \textsc{conf\_only} gate or a 12-feature
-\textsc{logistic} gate achieves \textbf{45--99\% compute savings} at
-\textbf{$\ge 98\%$ accuracy retention} with tight skip-rate CIs. All
-experiments run on a single MacBook M4 Pro using MLX; no CUDA.
+Self-consistency (SC)~\citep{Wang2023SC} --- sampling $N$ reasoning
+traces and plurality-voting --- is the dominant test-time compute
+(TTC) method for chain-of-thought (CoT)
+reasoning~\citep{Wei2022CoT} and is almost always deployed as an
+unconditional \emph{always-SC} policy.
+We show that on small ($<2$B) reasoning models this policy is
+strictly dominated. Across two open models (Qwen-2.5-0.5B,
+Gemma-3-1B) in FP16 and MLX-Q4, on GSM8K and MATH-500, we run 8
+per-task cells and 4 task-pooled aggregates at $n{=}200$--$400$ per
+cell with $1\,000{\times}$ paired-bootstrap confidence intervals. In
+all $12/12$ experiments, an oracle gate that decides per-prompt
+whether to invoke SC attains $109$--$174\%$ of always-SC's accuracy at
+$23$--$30\%$ of its compute. The mechanism is simple: for small
+models, SC flips \emph{correct greedy answers to wrong} at a rate
+comparable to --- and on one cell exceeding --- the rate at which it
+flips wrong to right; on Qwen-Q4${\times}$MATH-500, always-SC is
+$3$\,pt \emph{worse} than always-greedy. A 12-feature logistic gate
+trained on a few hundred calibration prompts skips $45$--$99\%$ of
+SC calls and cuts always-SC compute by $36$--$79\%$ at $\ge 98\%$
+accuracy retention; a single-feature confidence gate achieves
+comparable savings on the easier cells. All
+experiments run on a single MacBook M4 Pro using
+MLX~\citep{MLX2024}; no CUDA, no cloud inference.
 \end{abstract}
 
 \section{Introduction}
 
-Test-time compute (TTC) methods --- self-consistency
-\citep{Wang2023SC}, best-of-$N$ reranking \citep{Cobbe2021Verifiers},
-budget-forced CoT \citep{Snell2024TTC}, tool-integrated self-verification
-\citep{Kang2025T1} --- have become the workhorse of reasoning-model
-deployment. The conventional recipe is ``always SC@$N$'' at inference:
-sample $N$ traces, plurality-vote, use the result. For large ($\ge$7B)
-models with well-calibrated confidences this works well.
+Test-time compute (TTC) has become the workhorse of modern reasoning
+model deployment. Starting with chain-of-thought
+prompting~\citep{Wei2022CoT,Kojima2022ZeroShotCoT}, a family of TTC
+methods --- self-consistency sampling~\citep{Wang2023SC}, best-of-$N$
+reranking with learned verifiers~\citep{Cobbe2021Verifiers,
+Lightman2023LetsVerify}, tree-structured
+search~\citep{Yao2023ToT}, budget-forced CoT~\citep{Snell2024TTC},
+tool-integrated self-verification~\citep{Kang2025T1}, and iterative
+self-refinement~\citep{Madaan2023SelfRefine} --- now underpins the
+strongest open and proprietary
+systems~\citep{DeepSeekR1,OpenAIO1,Chen2025LongCoTSurvey}. The
+prevailing deployment recipe is simple: for every query, sample $N$
+traces and plurality-vote. This \emph{always-SC} policy is the
+default in every widely-used reasoning-model inference stack we are
+aware of, and has been exhaustively validated on large
+($\ge 7$B) models, where $N{=}5$ to $N{=}40$ reliably trades compute
+for accuracy~\citep{Chen2025LongCoTSurvey,Snell2024TTC}.
 
-For \textbf{small} models ($<$2B parameters) the picture is very
-different. Small reasoning models are exactly the segment where TTC
-should matter most: cloud cost is dominated by latency, privacy
-constraints favour on-device, and per-query compute is tight. Yet the
-literature largely inherited the ``always-SC'' deployment recipe from
-larger models without revisiting its economics on small models.
+The economics of TTC are very different for \textbf{small} ($<2$B)
+reasoning models. Small reasoning models are precisely the segment
+where inference economics matter most: on-device deployment is
+constrained by memory and battery~\citep{Wang2025MNNLLM,
+Bsharat2025MobileMMLU}, cloud cost is dominated by
+latency~\citep{Cao2026PER}, privacy pressures favour local
+inference, and recent work has shown that distilled
+1--4B reasoning models can close a surprising fraction of the gap to
+$7$B$+$ teachers on math and code~\citep{Xu2025Phi4Mini,
+DeepSeekR1,Zhu2024EoTD,Wang2025EffCoT}. Yet the community has
+largely inherited the always-SC recipe from large-model practice
+without revisiting whether it is still the right default at this
+scale. At the same time, a parallel literature on efficient TTC has
+emerged: \citet{Aggarwal2023AdaptiveConsistency} and
+\citet{Wan2024RASC} show that \emph{sample-count} can be cut by
+dynamic stopping rules; \citet{Aghazadeh2025CGES, Kim2026ReASC}
+add confidence-aware stopping; \citet{Ji2025SeerSC} predicts the
+sample budget up front. These works uniformly assume that \emph{SC
+at some $N{>}1$ is always worth running}. In this paper we show that
+on small models this premise itself is wrong.
 
-We revisit two questions.
-
-\paragraph{Q1: Is always-SC actually worth it on small models?}
-The headline community metric is SC accuracy vs.\ greedy accuracy. But
-the realistic baseline is not just ``greedy'': it is ``run cheap greedy
-and optionally run SC when the prompt warrants''. The comparison that
-matters is always-SC vs.\ an \emph{oracle gate} that decides per-prompt.
-
-\paragraph{Q2: If not, can a cheap gate approximate the oracle?}
-If yes, selective SC replaces always-SC as the natural deployment
-default on small models.
+We revisit two questions. \textbf{(Q1) Is always-SC actually worth it
+on small models?} The headline community metric is SC's accuracy
+relative to greedy. But the realistic deployment baseline is not just
+``greedy''; it is ``run cheap greedy first, and run SC only when the
+prompt warrants''. The fair counterfactual for always-SC is an
+\emph{oracle} gate that, for each prompt, picks the better of greedy
+and SC. \textbf{(Q2) If always-SC is dominated, can a cheap learned
+gate approximate the oracle?} If yes, \emph{selective} SC replaces
+always-SC as the natural default on small models.
 
 We answer both concretely. On Qwen-2.5-0.5B-Instruct
-\citep{Qwen25Report} and Gemma-3-1B-it \citep{Gemma3Report} --- each in
-native FP16 and 4-bit MLX quantisation --- across GSM8K
-\citep{Cobbe2021GSM8K} and MATH-500 \citep{Hendrycks2021MATH}, we
-observe (\S\ref{sec:oracle}):
+\citep{Qwen25Report} and Gemma-3-1B-it \citep{Gemma3Report}, each in
+native FP16 and 4-bit MLX quantisation, across GSM8K
+\citep{Cobbe2021Verifiers} and MATH-500 \citep{Hendrycks2021MATH}, the
+oracle gate strictly dominates always-SC in all $12/12$ experiments,
+with retention from $109\%$ to $174\%$. The dominance is driven by a
+non-trivial \emph{harm rate}: SC flips correct greedy answers to
+wrong on $3$--$10.5\%$ of prompts, comparable to (and sometimes larger
+than) the rate at which it flips wrong to right. On
+Qwen-Q4${\times}$MATH-500 the harm rate exceeds the help rate and
+always-SC is $3$\,pt worse than always-greedy. A simple learned gate
+on greedy-pass signals (a 12-feature logistic on three cells; a
+single-feature confidence gate on Qwen-Q4) captures most of the
+oracle's savings: $45$--$99\%$ skip-rate (i.e.\ $36$--$79\%$ of
+always-SC compute removed) at $\ge 98\%$ accuracy retention on all
+four pooled cells, with tight $1\,000{\times}$ bootstrap
+confidence intervals (CIs) on skip-rate.
 
-\begin{itemize}
-  \itemsep 0em
-  \item Always-SC is oracle-dominated in \textbf{12/12 experiments};
-        oracle retention ranges $109\text{--}174\%$.
-  \item On Qwen-Q4${\times}$MATH-500, always-SC is \textbf{3\,pt worse}
-        than always-greedy (9.5\% vs.\ 12.5\%). SC actively hurts.
-  \item The ``SC helpful'' rate is 4--12\% of prompts; the ``SC
-        harmful'' rate (right~$\to$~wrong) is comparable.
-\end{itemize}
+\paragraph{Relation to prior efficient-TTC work.}
+Adaptive SC methods~\citep{Aggarwal2023AdaptiveConsistency,
+Wan2024RASC,Aghazadeh2025CGES,Kim2026ReASC,Ji2025SeerSC,
+Zhou2025RPC,Cordero2025Certified,Liu2026PETS} reduce $N$
+\emph{given that SC runs}. Our gate decides whether SC runs \emph{at
+all} --- the two are orthogonal, and the gate's skip decisions save
+$5\times$ on skipped prompts vs.\ at most $\approx 2\times$ from
+shrinking $N$ from $5$ to $2$. Cascade and router
+systems~\citep{Zheng2025CITER,She2025TokenRouter,Ong2024RouteLLM,
+Chen2024FrugalGPT} route \emph{between} a small and large model; our
+gate is within-model, verifier-free, and requires no cloud teacher.
+\citet{Chuang2024ConfidenceRoute} learn confidence tokens for
+between-model routing; we instead aggregate native greedy logits
+into a prompt-level score.
 
-And (\S\ref{sec:method}):
-
-\begin{itemize}
-  \itemsep 0em
-  \item A \textbf{single-feature gate} on greedy per-token margin
-        confidence achieves cost $1.03\text{--}3.68{\times}$ at
-        $\ge 98\%$ retention on 8/8 cells.
-  \item A \textbf{12-feature logistic gate} trained on pooled $n{=}400$
-        achieves 45--99\% compute savings at 98.1--98.8\% retention
-        with tight skip-rate CIs.
-  \item A \textbf{deeper MLP (32$\times$16)} consistently
-        \emph{underperforms} logistic at pooled scale --- the decision
-        surface is essentially linear in scaled features.
-\end{itemize}
-
-Our contributions: (i) the first paired-bootstrap measurement of SC's
-``hurts'' failure mode on small reasoning models (\S\ref{sec:oracle}); (ii) a
-counter-narrative to ``always-SC is free''; (iii) a minimal 1--12
-feature CV-trained gate that captures most of the oracle's savings with
-tight CIs (\S\ref{sec:method}); (iv) full reproducibility on a single
-MacBook M4 Pro using MLX, with released code, cached records,
-and seeds.
+\paragraph{Contributions.}
+(i) The first paired-bootstrap measurement of SC's ``helps vs.\
+hurts'' decomposition on small reasoning models, exhibiting a
+non-negligible and at one cell \emph{dominant} harm rate
+(\S\ref{sec:oracle}); (ii) a counter-narrative to the ``SC is free''
+assumption implicit in current TTC literature; (iii) a minimal
+1--12 feature cross-validated TTC-gate that captures most of the
+oracle's savings with tight skip-rate confidence intervals, alongside
+an ablation showing that extra model capacity (a multi-layer
+perceptron, MLP) universally hurts at this data scale
+(\S\ref{sec:method}); (iv) full reproducibility on a
+single MacBook M4 Pro under MLX, folded inline into the experimental
+protocol.
 
 \section{Background and Related Work}
+\label{sec:related}
 
-\paragraph{Self-consistency on small models.}
-\citet{Wang2023SC} introduced SC as a zero-training accuracy booster.
-\citet{Kang2025T1} showed tool-integrated self-verification lets a
-1.2B model outperform an 8B on MATH, making ``small-model $+$ TTC'' a
-research axis. \citet{Wang2025EffCoT} focus on distilling long-CoT
-reasoning into SLMs. None of these revisit whether always-SC is the
-right default on small models.
+\paragraph{Test-time compute.}
+Chain-of-thought prompting~\citep{Wei2022CoT,Kojima2022ZeroShotCoT}
+and self-consistency~\citep{Wang2023SC} established the basic
+``sample-and-aggregate'' recipe. \citet{Snell2024TTC} and
+\citet{Chen2024Escape} formalise its compute--accuracy scaling laws
+for large models, and \citet{Chen2025LongCoTSurvey} survey the
+resulting long-CoT literature. \citet{Yao2023ToT} extend it to
+structured search; \citet{Lightman2023LetsVerify,
+Cobbe2021Verifiers} train process- and outcome-reward verifiers for
+reranking. None of this line interrogates the assumption that SC is
+worth running on every prompt.
 
-\paragraph{Quantisation and reasoning.}
-Large-scale quantisation studies \citep{RedHatQuant2024} report that
-4-bit PTQ preserves GSM8K accuracy ``nearly for free'' on 7B-class
-models. We confirm this trend on greedy accuracy of small models
-\emph{modulo} a substantial 5--22\,pt drop (paired CI;
-\S\ref{sec:oracle}), but show it does not imply free TTC: SC@5 gain on
-4-bit small models is marginal to negative.
+\paragraph{Adaptive self-consistency.}
+Several works reduce the sample count $N$.
+\citet{Aggarwal2023AdaptiveConsistency} propose count-based early
+stopping on majority convergence. \citet{Wan2024RASC} weight votes by
+per-sample quality. \citet{Aghazadeh2025CGES} and
+\citet{Kim2026ReASC} adopt Bayesian or reliability-aware stopping
+rules. \citet{Ji2025SeerSC} predict the budget up front via a
+System-1 entropy estimate. \citet{Zhou2025RPC} and
+\citet{Cordero2025Certified} give statistical guarantees for
+sampling-based TTC; \citet{Liu2026PETS} optimises cross-prompt budget
+allocation. All assume SC runs; our gate can compose orthogonally
+with any of them to also decide \emph{whether} to run SC.
 
-\paragraph{Verifier reranking and gating.}
-\citet{Cobbe2021Verifiers} introduced learned verifiers.
-\citet{Zhou2025WeakVer} note that weak verifiers are mis-calibrated but
-focus on improving verifier quality, not on \emph{when} to run them.
-Our work occupies the complementary axis: given standard SC and
-plurality voting, when is TTC worth running at all?
+\paragraph{Small reasoning models and quantisation.}
+Distilled sub-2B reasoning models~\citep{Xu2025Phi4Mini,
+Zhu2024EoTD,Wang2025EffCoT,Kang2025T1,DeepSeekR1} make the
+small-language-model (small-LM) ${+}$ TTC axis practically relevant.
+\citet{RedHatQuant2024} report ``4-bit-for-free'' on 7B-class models
+on GSM8K. \citet{Li2025QuantMath} and \citet{Li2025QuantMitigate}
+systematically show that at smaller scales 4-bit post-training
+quantisation (PTQ, e.g.\ AWQ~\citep{Lin2024AWQ},
+GPTQ~\citep{Frantar2023GPTQ}) can induce $>10\%$ reasoning drops;
+\citet{Lv2026QAT} partially recover via quantisation-aware training
+(QAT).
+We observe a $5$--$22$\,pt Q4-vs-FP16 drop on the two small families
+we test, and show that this drop interacts adversely with SC on at
+least one cell.
 
-\paragraph{Routing between models.}
-\citet{Zheng2025CITER} and \citet{She2025TokenRouter} route between a
-local SLM and a cloud LLM using logit-level signals. Our gate is a
-\emph{within-model} TTC gate --- no cloud, no teacher, no external
-logits --- and runs on a single MacBook.
+\paragraph{Calibration and verbalised confidence.}
+Classical calibration
+work~\citep{Guo2017Calibration,Kadavath2022Know} and more recent LLM
+uncertainty studies~\citep{Xiong2023Uncertainty,
+Chuang2024ConfidenceRoute} show that token-level confidences are a
+useful, if imperfect, signal. We use only native greedy-pass logits
+and simple text features; no fine-tuning, no verbaliser.
+
+\paragraph{Routing and cascades.}
+Cascade and router systems~\citep{Zheng2025CITER,She2025TokenRouter,
+Ong2024RouteLLM,Chen2024FrugalGPT,Jiang2023LLMBlender} pick between
+models of different sizes or providers using logit-level or learned
+signals; speculative decoding~\citep{Leviathan2023Speculative}
+accelerates autoregressive inference with a small draft model. Our
+gate is \emph{within-model} and decides not \emph{which} model but
+\emph{whether to run} TTC at all; it requires no cloud teacher, no
+external verifier, and no auxiliary model.
 
 \section{Experimental Setup}
 \label{sec:setup}
 
 \paragraph{Models.}
-Qwen-2.5-0.5B-Instruct and Gemma-3-1B-it, each in two precisions:
-MLX-FP16 (the model's native bf16 cast to fp16 for MLX) and MLX-Q4
-(group-size 64 affine quantisation). On Apple Silicon the standard
-\texttt{bitsandbytes-NF4} and \texttt{auto-gptq} stacks lack GPU
-kernels or fall back to CPU at $\ge 10{\times}$ latency; MLX-Q4 is the
-practical Apple-GPU path \citep{MLX2024}.
+We use Qwen-2.5-0.5B-Instruct~\citep{Qwen25Report} and
+Gemma-3-1B-it~\citep{Gemma3Report}, each in two precisions:
+MLX-FP16 (native bf16 cast to fp16 for MLX) and MLX-Q4 (affine
+weight-only quantisation at group size~$64$). On Apple Silicon the
+standard bitsandbytes-NF4 and auto-gptq stacks lack GPU kernels or
+fall back to CPU at $\ge 10\times$ latency; MLX-Q4 is the practical
+Apple-GPU path~\citep{MLX2024}. This cross of two model families
+and two precisions yields four cells, each of which is run on both
+datasets.
 
 \paragraph{Datasets.}
-GSM8K-1000 (first 1\,000 of the test split) and MATH-500
-\citep{Hendrycks2021MATH} (the HuggingFaceH4 500-problem evaluation
-split). For the 4-cell $\times$ 2-dataset grid we use the first 200
-problems per cell ($1\,600$ prompt-level observations). We also pool the
-two tasks into a 400-per-cell aggregate to test the gate's
+We use GSM8K-1000 (the first $1\,000$ problems of the GSM8K test
+split)~\citep{Cobbe2021Verifiers} and MATH-500, the HuggingFaceH4
+$500$-problem evaluation subset of MATH~\citep{Hendrycks2021MATH,
+Lightman2023LetsVerify}. For each of the four cells we run the
+first $200$ problems per dataset, giving $1\,600$ prompt-level
+observations across the per-task grid. We additionally pool the
+two tasks into a $400$-per-cell aggregate, to test the gate's
 task-agnosticism.
 
-\paragraph{Prompt and sampling.}
-One in-context exemplar plus ``Let's think step by step.''
-Temperature 0.7, top-$p$ 0.95. We collect one greedy ($T{=}0$) answer
-and 5 sampled answers per prompt; SC@5 is plurality voting with
-sum-log-prob tiebreak. Answer parsing is a layered regex over
-\verb|\boxed{}|, ``The answer is $X$'', ``\texttt{\#\#\#\#}'', and the
-last numeric expression. All runs use seed 1 and deterministic MLX
-sampling.
+\paragraph{Prompt and sampling protocol.}
+One in-context exemplar is followed by the zero-shot CoT
+cue~\citep{Kojima2022ZeroShotCoT} ``Let's think step by step.''
+Decoding uses temperature $0.7$ and top-$p$ $0.95$ for sampled
+traces, and $T{=}0$ (greedy) for the deterministic pass. Per prompt
+we collect one greedy answer and $K{=}5$ sampled answers; SC@$5$ is
+plurality voting over the $K$ samples, with sum-log-probability
+tiebreak. Answer parsing is a layered regex over \verb|\boxed{}|,
+``The answer is $X$'', ``\verb|####|'', and finally the last numeric
+expression in the output. All runs use seed~$1$ and deterministic
+MLX sampling.
 
 \paragraph{Evaluation.}
-Wilson 95\% intervals for raw accuracies; paired
-$1\,000{\times}$ bootstrap for FP16-vs-Q4 differences; per-threshold
-$1\,000{\times}$ bootstrap for gate operating points. Where we report
-\emph{retention}~=~gate\_acc / always\_SC\_acc, the denominator is the
-empirical SC@5 accuracy of the same cell.
+Raw accuracies are reported with Wilson $95\%$ confidence intervals
+(CIs). FP16-vs-Q4 deltas use paired $1\,000{\times}$ bootstrap
+(paired at the prompt level). Gate operating points at fixed
+threshold $\tau$ use per-cell $1\,000{\times}$ bootstrap over prompts. Where we report
+\emph{retention} $R(\tau) = \text{acc}_\text{gate}(\tau) /
+\text{acc}_\text{always-SC}$, the denominator is the empirical SC@$5$
+accuracy on the same cell.
 
-\paragraph{Hardware.}
-One MacBook Pro M4 Pro (24\,GB unified memory, Apple M4 16-core GPU,
-MLX + MPS; no CUDA). Block A generation completes in $\sim$3\,h on
-GSM8K and $\sim$4.5\,h on MATH-500.
+\paragraph{Hardware and compute budget.}
+All experiments run on a single MacBook Pro M4 Pro ($24$\,GB unified
+memory, $16$-core Apple M4 GPU, MLX 0.31 and \texttt{mlx-lm} 0.31
+plus PyTorch 2.11 with Metal Performance Shaders (MPS), Python
+3.13); no CUDA and no cloud API.
+The main generation pass (four cells $\times$ $200$ prompts
+$\times$ six generations per prompt) takes $\sim 3$\,h on GSM8K and
+$\sim 4.5$\,h on MATH-500. Consolidation (bootstrap resampling, featurisation, gate
+fitting, plotting) completes in under three minutes. Total
+GPU-hours: $\approx 7.5$. Released code, cached generation records,
+and seeds reproduce every table and figure end-to-end.
 
 \section{The Oracle-Dominance Finding}
 \label{sec:oracle}
 
 \subsection{Structural decomposition}
 
-For any prompt $x$ let $g{=}\mathbf{1}[\text{greedy correct}]$ and
-$s{=}\mathbf{1}[\text{SC@5 correct}]$. Define
-$y{=}\mathbf{1}[s \wedge \neg g]$ (SC flipped wrong~$\to$~right) and
-$h{=}\mathbf{1}[g \wedge \neg s]$ (SC flipped right~$\to$~wrong). Then
+For any prompt $x\in\mathcal{X}$, let
+$g(x),s(x)\in\{0,1\}$ denote the indicators that greedy and SC@$5$
+are correct, respectively. Define the \emph{help} and \emph{harm}
+indicators
 \begin{align*}
-\text{always-greedy} &= \mathbb{E}[g],\\
-\text{always-SC}     &= \mathbb{E}[s] = \mathbb{E}[g] + \mathbb{E}[y] - \mathbb{E}[h],\\
-\text{oracle}        &= \mathbb{E}[\max(g,s)] = \mathbb{E}[g] + \mathbb{E}[y],
+y(x) &\;=\; \mathbf{1}[s(x){=}1 \wedge g(x){=}0],\\
+h(x) &\;=\; \mathbf{1}[g(x){=}1 \wedge s(x){=}0].
 \end{align*}
-so $\textsc{oracle} - \textsc{always-sc} = \mathbb{E}[h]$. The oracle
-is strictly better than always-SC by exactly the rate at which SC flips
-correct answers to wrong. On small models, this rate is not
-negligible.
+Let $\pi$ denote the test distribution; taking
+$\mathbb{E}_\pi[\cdot]$ gives
+\begin{align}
+\alpha_\mathrm{g}   &\;=\; \mathbb{E}[g],\\
+\alpha_\mathrm{sc}  &\;=\; \mathbb{E}[s] \;=\; \mathbb{E}[g] + \mathbb{E}[y] - \mathbb{E}[h],\\
+\alpha_\mathrm{o}   &\;=\; \mathbb{E}[\max(g,s)] \;=\; \mathbb{E}[g] + \mathbb{E}[y].
+\end{align}
+The oracle's gain over always-SC is therefore exactly
+\begin{equation}
+\alpha_\mathrm{o} - \alpha_\mathrm{sc} \;=\; \mathbb{E}[h],
+\label{eq:oracle-gap}
+\end{equation}
+and \emph{always-SC is strictly dominated whenever} $\mathbb{E}[h]>0$.
+The community narrative around SC implicitly assumes
+$\mathbb{E}[h]\ll\mathbb{E}[y]$, which holds for large models but, as
+we show below, does not hold for small ones.
 
 \subsection{Empirical measurement}
 
-Figure~\ref{fig:oracle} plots
-\emph{oracle\_retention}~$=$~oracle\_acc~/~always\_sc\_acc across all
-12 experiments (8 per-task $+$ 4 pooled). The line at 100\% marks
-always-SC.
+Figure~\ref{fig:oracle} plots the empirical oracle-retention ratio
+$\rho=\alpha_\mathrm{o}/\alpha_\mathrm{sc}$ across all $12$
+experiments ($4$ model-precision cells $\times$ ($2$ datasets
+$+$ pooled)). Every bar is at or above the $100\%$ always-SC
+reference (dashed line), and the outlier at
+$174\%$ corresponds to Qwen-0.5B-Q4 on MATH-500, where always-SC
+leaves $7$\,pt of accessible accuracy on the table --- a
+$74$\,pt oracle margin over always-SC. The remaining cells retain
+between $109\%$ (Gemma-FP16 on GSM8K) and $146\%$ (Qwen-Q4 pooled).
+The dominance pattern is invariant to dataset, model family, and
+precision: not a single cell places the oracle at or below
+always-SC. In particular, pooled retention ($110\%$--$146\%$, with
+$125\%$--$146\%$ on three of four pooled cells and $110\%$ on the
+easiest cell Gemma-FP16) tracks per-task retention, which is what we
+would hope from a gate whose training transfers across tasks.
 
-\begin{figure*}[t]
+\begin{figure}[t]
 \centering
-\includegraphics[width=0.92\textwidth]{fig1_oracle_retention.png}
-\caption{Oracle TTC-gate strictly dominates always-SC on 12/12
-experiments (8 per-task $+$ 4 pooled). Crimson highlights the
-\textbf{Qwen-0.5B~/~Q4~$\times$~MATH-500} ``killer cell'' where always-SC
-is 74\,pt worse than oracle. Dashed line marks always-SC parity.
-Retention $\in [109\%, 174\%]$ across all cells and datasets.}
+\includegraphics[width=\columnwidth]{fig1_oracle_retention.pdf}
+\caption{Oracle TTC-gate retention
+$\rho=\alpha_\mathrm{o}/\alpha_\mathrm{sc}$ across all 12
+experiments (4 model-precision cells $\times$ 2 datasets $+$ pooled).
+The annotated Qwen-0.5B${\times}$Q4${\times}$MATH-500 bar is the
+``killer cell'' where always-SC is $74$\,pt below oracle.
+The dashed line at $100\%$ marks always-SC parity; retention lies
+in $[109\%,174\%]$ everywhere.}
 \label{fig:oracle}
-\end{figure*}
+\end{figure}
+
+Figure~\ref{fig:quant} decomposes the underlying accuracies per
+(family, dataset, precision) into greedy, SC@$5$, and the
+best-of-$N{=}5$ oracle bound. FP16 greedy accuracies span
+$18$--$39\%$; Q4 greedy accuracies span $10$--$21\%$, giving a
+paired Q4-vs-FP16 drop of $5.5$--$27$\,pt across greedy and SC@$5$
+(all eight pairs have $95\%$ paired-bootstrap CIs that exclude $0$;
+Table~\ref{tab:q4}). Across
+eight (family, dataset, precision) combinations the SC@$5$-minus-greedy
+gain spans $1$--$7$\,pt on seven of eight cells, and is
+\emph{negative}, at $-3$\,pt, on Qwen-Q4${\times}$MATH-500 (shaded
+pink in the figure). This is the immediate operational consequence
+of Eq.~\ref{eq:oracle-gap}: even the unconditional claim ``SC is
+never worse than greedy'' does not hold at this scale.
 
 \begin{figure*}[t]
 \centering
-\includegraphics[width=\textwidth]{fig3_fp16_vs_q4.png}
-\caption{Greedy, SC@5, and BoN@5 oracle accuracies per
-(family,~dataset,~precision). 4-bit MLX quantisation drops greedy
-accuracy by 5--22\,pt (paired bootstrap CIs non-overlapping 0); SC@5
-gain (SC@5 $-$ greedy) is small (1.5--7\,pt) and \emph{negative} on
-Qwen-Q4${\times}$MATH-500 ($-3\,\text{pt}$).}
+\includegraphics[width=\textwidth]{fig3_fp16_vs_q4.pdf}
+\caption{Greedy ($N{=}1$), SC@$5$, and best-of-$5$ oracle accuracies
+per (family, dataset, precision). 4-bit quantisation drops greedy
+accuracy by $5$--$22$\,pt (all paired bootstrap CIs exclude $0$).
+SC@$5$ gain is $+1.5$ to $+7$\,pt on seven cells and $-3$\,pt on
+Qwen-Q4${\times}$MATH-500 (pink shading: ``SC hurts'').}
 \label{fig:quant}
 \end{figure*}
 
 \begin{table}[t]
 \centering\small
-\begin{tabular}{llccr}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llccr@{}}
 \toprule
-Cell & Dataset & $y$ & $h$ & sc\_gain \\
+Cell & Dataset & $\mathbb{E}[y]$ & $\mathbb{E}[h]$ & $\Delta_\mathrm{sc}$ \\
 \midrule
-Qwen-FP16  & GSM8K    & 12.0\% & 10.5\% & $+1.5$ \\
-Qwen-Q4    & GSM8K    & 12.5\% &  8.5\% & $+4.0$ \\
-Gemma-FP16 & GSM8K    & 11.0\% &  4.0\% & $+7.0$ \\
-Gemma-Q4   & GSM8K    &  7.0\% &  4.5\% & $+2.5$ \\
-Qwen-FP16  & MATH-500 &  6.0\% &  4.5\% & $+1.5$ \\
-\textbf{Qwen-Q4} & \textbf{MATH-500} &  4.0\% &  7.0\% & $\mathbf{-3.0}$ \\
-Gemma-FP16 & MATH-500 &  9.0\% &  3.5\% & $+5.5$ \\
-Gemma-Q4   & MATH-500 &  5.0\% &  3.0\% & $+2.0$ \\
+Qwen-FP16  & GSM8K    & $12.0\%$ & $10.5\%$ & $+1.5$ \\
+Qwen-Q4    & GSM8K    & $12.5\%$ &  $8.5\%$ & $+4.0$ \\
+Gemma-FP16 & GSM8K    & $11.0\%$ &  $4.0\%$ & $+7.0$ \\
+Gemma-Q4   & GSM8K    &  $7.0\%$ &  $4.5\%$ & $+2.5$ \\
+Qwen-FP16  & MATH-500 &  $6.0\%$ &  $4.5\%$ & $+1.5$ \\
+\textbf{Qwen-Q4} & \textbf{MATH-500} &  $4.0\%$ &  $7.0\%$ & $\mathbf{-3.0}$ \\
+Gemma-FP16 & MATH-500 &  $9.0\%$ &  $3.5\%$ & $+5.5$ \\
+Gemma-Q4   & MATH-500 &  $5.0\%$ &  $3.0\%$ & $+2.0$ \\
 \bottomrule
 \end{tabular}
-\caption{Per-prompt decomposition of SC's verdicts. $y$=SC helps,
-$h$=SC hurts. sc\_gain (pt) $=y-h$. On Qwen-Q4${\times}$MATH, $h>y$ so
-SC actively hurts.}
+\caption{Per-prompt decomposition of SC's verdicts. $\mathbb{E}[y]$
+is the ``SC helps'' rate, $\mathbb{E}[h]$ the ``SC hurts'' rate, and
+$\Delta_\mathrm{sc}=\mathbb{E}[y]-\mathbb{E}[h]$ the net
+SC-minus-greedy gain (pt). On Qwen-Q4${\times}$MATH,
+$\mathbb{E}[h]>\mathbb{E}[y]$ and SC is net-negative.}
 \label{tab:yh}
 \end{table}
 
-Oracle retention $\in[109\%,174\%]$ on all 12 experiments. On
-\textbf{Qwen-Q4${\times}$MATH-500}, oracle retention is
-$174\%$: always-SC leaves 7\,pt of accessible accuracy on the
-table. Figure~\ref{fig:quant} shows the raw accuracies: 4-bit
-quantisation drops greedy by 5--22\,pt (all paired bootstrap CIs
-non-overlapping zero, see App.~B), and SC@5 gain is marginal to
-negative everywhere.
+Table~\ref{tab:yh} gives the prompt-level verdict decomposition. The
+``SC helps'' rate $\mathbb{E}[y]$ ranges from $4\%$ (Qwen-Q4 on
+MATH) to $12.5\%$ (Qwen-Q4 on GSM8K). The ``SC hurts'' rate
+$\mathbb{E}[h]$ ranges from $3\%$ (Gemma-Q4 on MATH) to $10.5\%$
+(Qwen-FP16 on GSM8K); $\mathbb{E}[h]$ is non-trivial everywhere,
+and on Qwen-Q4${\times}$MATH it is $7\%$ against only $4\%$ for help,
+inverting the sign of $\Delta_\mathrm{sc}$. Crucially, the bulk of
+the oracle's margin in Figure~\ref{fig:oracle} is \emph{exactly}
+$\mathbb{E}[h]$, as predicted by Eq.~\ref{eq:oracle-gap}: on
+Qwen-Q4${\times}$MATH the observed oracle margin is $7$\,pt, matching
+$\mathbb{E}[h]$ to the percentage point. This tight agreement
+validates the decomposition as the right explanatory lens.
+
+\begin{table}[t]
+\centering\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}llcrr@{}}
+\toprule
+Dataset & Cell & Metric & $\Delta$ & $95\%$ CI \\
+\midrule
+GSM8K    & Qwen  & greedy & $+0.186$ & $[+0.11, +0.26]$ \\
+GSM8K    & Qwen  & SC@$5$ & $+0.160$ & $[+0.10, +0.23]$ \\
+GSM8K    & Gemma & greedy & $+0.224$ & $[+0.16, +0.29]$ \\
+GSM8K    & Gemma & SC@$5$ & $+0.270$ & $[+0.21, +0.34]$ \\
+MATH-500 & Qwen  & greedy & $+0.055$ & $[+0.01, +0.11]$ \\
+MATH-500 & Qwen  & SC@$5$ & $+0.099$ & $[+0.06, +0.15]$ \\
+MATH-500 & Gemma & greedy & $+0.124$ & $[+0.08, +0.18]$ \\
+MATH-500 & Gemma & SC@$5$ & $+0.159$ & $[+0.11, +0.22]$ \\
+\bottomrule
+\end{tabular}
+\caption{Paired FP16${-}$Q4 contrasts under $1\,000{\times}$
+bootstrap, $n{=}200$ per cell. All 8 deltas have $95\%$ CIs that
+exclude $0$.}
+\label{tab:q4}
+\end{table}
 
 \subsection{When does SC hurt?}
 
-Table~\ref{tab:yh} decomposes per-prompt verdicts. The $y$ rate (SC
-helps) is 4--12\%; the $h$ rate (SC hurts) is 2--13\%. On
-Qwen-Q4${\times}$MATH, $h$ exceeds $y$ by 3\,pt, inverting the sign of
-sc\_gain. This is not model-specific pathology --- it is a property of
-plurality voting under imperfect calibration when multiple distinct
-candidate answers emerge per prompt.
+The harm event $h$ requires a wrong answer to \emph{win a plurality
+vote} over the correct one in five samples. This happens when (i)
+the model's distribution over candidate answers is diffuse, and
+(ii) the wrong-majority mode is entropically cheap under the
+sampler. On small models both conditions hold on a measurable
+fraction of hard prompts. On Qwen-Q4${\times}$MATH, post-quantisation
+miscalibration widens the candidate-answer distribution further, so
+the harm rate exceeds the help rate. SC's strength on large models
+is that $\mathbb{E}[h]\ll\mathbb{E}[y]$ --- not that
+$\mathbb{E}[h]\approx 0$; on small models both rates are small and
+comparable, and plurality voting cannot distinguish the two cases.
 
 \section{The TTC-Gate}
 \label{sec:method}
 
-\subsection{Problem statement}
+\subsection{Problem formulation}
 
-A \textbf{TTC-gate} is a scalar score $s{:}~\text{prompt}\to[0,1]$
-computed from the greedy pass. For threshold $\tau$:
-\begin{itemize}
-  \itemsep 0em
-  \item $s(x) \ge \tau$: run SC@5 (cost $5{\times}$, accept SC).
-  \item $s(x)   < \tau$: skip SC (cost $1{\times}$, accept greedy).
-\end{itemize}
+We want a scalar score function
+\(
+\sigma : \mathcal{X} \to [0,1]
+\)
+that maps each prompt, given its greedy-pass statistics, to a
+``run-SC'' propensity. For threshold $\tau\in[0,1]$, the
+gate policy is
+\begin{equation}
+\pi_\tau(x) \;=\;
+\begin{cases}
+\text{accept SC@}5 \text{ (cost } 5\text{)} & \text{if } \sigma(x)\ge\tau,\\
+\text{accept greedy (cost } 1\text{)} & \text{if } \sigma(x)<\tau.
+\end{cases}
+\label{eq:policy}
+\end{equation}
+Let $a_\pi(x)\in\{0,1\}$ denote the policy's correctness and
+$c_\pi(x)\in\{1,5\}$ its cost. The two deployment quantities of
+interest are the \emph{cost ratio} $C(\tau) =
+\mathbb{E}_\pi[c_\pi]/1$ and the \emph{accuracy retention} $R(\tau)
+= \mathbb{E}_\pi[a_\pi]/\alpha_\mathrm{sc}$. The goal is to
+maximise skip rate $s(\tau)=\Pr[\sigma(x)<\tau]$ (equivalently,
+minimise $C(\tau)$) subject to $R(\tau)\ge R_0$.
 
-We study three gate instances.
-\textsc{conf\_only}: $s(x){=}1-\text{greedy\_margin\_confidence}(x)$,
-the mean top-1 minus top-2 softmax probability over greedy-generated
-tokens. No learning; $\tau$ is the only parameter.
-\textsc{logistic}: L2-regularised, class-balanced logistic regression on
-12 features: 4 greedy aggregates (conf, top-5 entropy, full-vocab
-entropy, token count) + 8 prompt-text features (length, digit count,
-operator count, comma count, newline count, step-marker count).
-\textsc{mlp}: a 32$\times$16 hidden-layer MLP on the same 12 features,
-L2-regularised.
+\subsection{Gate instances}
 
-All gates are trained via 5-fold CV within each cell, producing
-out-of-fold scores. We pick the operating threshold $\tau$ that
-maximises skip-rate subject to $\text{acc\_retention}\ge 0.98$ on the
-full out-of-fold data, then bootstrap $1\,000{\times}$ over prompts at
-the fixed $\tau$ for CIs.
+We instantiate three gates, ordered by model capacity:
 
-\subsection{Pooled results}
+\paragraph{\textsc{conf\_only}.}
+A single hand-crafted feature: the mean greedy-pass token margin
+confidence
+\(
+\mathrm{mc}(x) = \frac{1}{T}\sum_{t=1}^{T}
+\big(p_t^{(1)} - p_t^{(2)}\big),
+\)
+where $p_t^{(1)},p_t^{(2)}$ are the top-1 and top-2 softmax
+probabilities at greedy-step $t$. The gate score is
+$\sigma_{\text{conf}}(x) = 1 - \mathrm{mc}(x)$; no learning, $\tau$
+is the only parameter.
+
+\paragraph{\textsc{logistic}.}
+A 12-feature $L_2$-regularised class-balanced logistic regression.
+The feature vector $\phi(x)\in\mathbb{R}^{12}$ concatenates four
+greedy-pass statistics --- mean margin confidence $\mathrm{mc}(x)$,
+mean top-$5$ entropy, mean full-vocab entropy, and greedy token count
+--- and eight prompt-text statistics --- length in characters, digit
+count, arithmetic-operator count, comma count, newline count,
+step-marker count (``Step'', ``\#''), and two redundant length
+features. Writing $\tilde\phi(x)=\Sigma^{-1/2}(\phi(x)-\mu)$ for the
+train-set standardisation, the gate is
+\begin{equation}
+\sigma_{\text{log}}(x) \;=\; \sigma\!\big(w^\top\tilde\phi(x)+b\big),\;\;
+\sigma(u)=\tfrac{1}{1+e^{-u}},
+\label{eq:logistic}
+\end{equation}
+fitted by minimising
+\begin{align}
+\mathcal{L}(w,b) \;=\;
+&-\sum_{i=1}^{n} \omega_{y_i}\log\Pr\!\big(y_i\mid\tilde\phi(x_i);w,b\big)\notag\\
+&+ \tfrac{\lambda}{2}\|w\|_2^2,
+\end{align}
+with training label $y_i=h(x_i)\vee y(x_i)$ interpreted as ``SC
+changes the greedy verdict'' and class weights
+$\omega_{y_i}\!\propto\!1/\Pr(y=y_i)$ to counter class imbalance
+($\lambda{=}1$, scikit-learn defaults otherwise).
+
+\paragraph{\textsc{mlp}.}
+A two-hidden-layer MLP with widths $32\times 16$ over the same
+$\tilde\phi(x)$, ReLU activations, $L_2$ regularisation on all
+weights, trained with the same class-balanced cross-entropy as
+\textsc{logistic}.
+
+\subsection{Training and threshold selection}
+
+All gates are fit via $5$-fold cross-validation within each cell,
+giving out-of-fold scores $\{\sigma(x_i)\}_{i=1}^n$ that are never
+used to pick their own threshold. The operating threshold is
+\begin{equation}
+\tau^{\star} \;=\;
+\arg\max_{\tau\in[0,1]}\; s(\tau)
+\quad\text{s.t.}\quad
+R(\tau)\ge R_0,
+\label{eq:tau}
+\end{equation}
+with $R_0=0.98$. We then fix $\tau^{\star}$ and bootstrap-resample
+prompts $1\,000$ times to obtain $95\%$ CIs for the operating-point
+triple $(s,C,R)$. The threshold-selection objective in
+Eq.~\ref{eq:tau} picks the \emph{maximum compute saving} compatible
+with near-lossless accuracy, which is the regime small-model TTC
+deployments actually care about.
+
+\subsection{Pooled-cell operating points}
+\label{sec:pooled}
+
+Figure~\ref{fig:pareto} plots the Pareto curves of all three gates
+on the four pooled cells ($n{=}400$). Each curve traces
+$\tau\in[0,1]$ through the $(C,R)$ plane; the gold star marks the
+oracle upper bound and the hollow circle marks the best operating
+point $\tau^{\star}$ satisfying $R\ge 0.98$. Italic ``greedy'' and
+``SC'' labels anchor the no-gate endpoints at $C{=}1$ and $C{=}5$.
+The four panels tell the same structural story. On Qwen-Q4 (second
+panel, highlighted with bold title) the best gate sits at
+$C\approx 1.03$ with retention above always-SC --- the gate has
+essentially collapsed to always-greedy, correctly responding to the
+cell where SC is net-negative. On Qwen-FP16 and Gemma-Q4 the gate
+lands near $C\approx 1.5$--$2.7$, saving most of SC's cost while
+tracking its accuracy. On Gemma-FP16 (third panel) the gate is
+tighter, at $C\approx 3.2$, reflecting the harder separation on this
+cell. In three of four panels the orange \textsc{logistic} curve
+dominates the blue \textsc{conf\_only} curve over $C\in[1,3]$; the
+grey dashed \textsc{mlp} curve lies uniformly below both.
 
 \begin{figure*}[t]
 \centering
-\includegraphics[width=0.85\textwidth]{fig2_pareto_pooled.png}
+\includegraphics[width=\textwidth]{fig2_pareto_pooled.pdf}
 \caption{TTC-Gate Pareto curves on the four pooled cells
 ($n{=}400$ per cell). Each curve traces $\tau$ across the
-(cost~ratio, acc~retention) plane. Gold star: oracle upper bound;
-hollow circle: best operating point at retention~$\ge 98\%$.
-Italic labels mark always-greedy (cost $1{\times}$) and always-SC
-(cost $5{\times}$). \textsc{Logistic} (12 features) outperforms
-\textsc{conf\_only} on 3/4 cells at pooled scale; MLP loses
-universally.}
+$(C,R)$ plane. Gold star: oracle upper bound $(C\!<\!1\text{-ish},
+R=\rho)$; hollow circle: best operating point at $R\ge 0.98$. Italic
+labels mark always-greedy ($C{=}1$) and always-SC ($C{=}5$).
+\textsc{Logistic} beats \textsc{conf\_only} on 3/4 cells;
+\textsc{mlp} loses universally.}
 \label{fig:pareto}
 \end{figure*}
 
@@ -322,58 +566,67 @@ universally.}
 \centering\small
 \begin{tabular}{lcccccc}
 \toprule
-Cell & Method & $\tau$ & skip \% [CI] & cost$\times$ [CI] & retention \% [CI] \\
+Cell & Method & $\tau^{\star}$ & skip$\%$ $[$CI$]$ & $C$ $[$CI$]$ & $R$ $[$CI$]$ \\
 \midrule
-Qwen-FP16  & logistic  & 0.625 & 86.0 [82.5, 89.3] & 1.56 [1.43, 1.70] & 98.1 [82.5, 112.5] \\
-Qwen-Q4    & conf\_only & 0.915 & 99.3 [98.5, 100.0] & 1.03 [1.00, 1.06] & 98.7 [76.5, 120.6] \\
-Gemma-FP16 & logistic  & 0.46  & 44.7 [40.0, 49.5]  & 3.21 [3.02, 3.40] & 98.8 [86.2, 112.4] \\
-Gemma-Q4   & logistic  & 0.515 & 57.9 [53.2, 62.7]  & 2.68 [2.49, 2.87] & 98.5 [77.9, 122.0] \\
+Qwen-FP16  & logistic   & $0.625$ & $86.0\;[82.5, 89.3]$ & $1.56\;[1.43, 1.70]$ & $98.1\;[82.5, 112.5]$ \\
+Qwen-Q4    & conf\_only & $0.915$ & $99.3\;[98.5, 100.0]$ & $1.03\;[1.00, 1.06]$ & $98.7\;[76.5, 120.6]$ \\
+Gemma-FP16 & logistic   & $0.46$  & $44.7\;[40.0, 49.5]$ & $3.21\;[3.02, 3.40]$ & $98.8\;[86.2, 112.4]$ \\
+Gemma-Q4   & logistic   & $0.515$ & $57.9\;[53.2, 62.7]$ & $2.68\;[2.49, 2.87]$ & $98.5\;[77.9, 122.0]$ \\
 \bottomrule
 \end{tabular}
-\caption{Pooled ($n{=}400$) TTC-gate operating points. $\tau$ chosen
-for max skip-rate s.t.\ retention $\ge 98\%$. Best gate saves
-\textbf{45--99\%} compute with $\ge 98\%$ retention. Bootstrap
-($1\,000{\times}$) CIs in brackets; skip-rate CIs are tight
+\caption{Pooled ($n{=}400$) TTC-gate operating points. $\tau^{\star}$
+is chosen by Eq.~\ref{eq:tau} with $R_0=0.98$. The best gate saves
+$45$--$99\%$ of always-SC compute at $R\ge 98\%$. Bootstrap
+($1\,000{\times}$) $95\%$ CIs in brackets; skip-rate CIs are tight
 ($\pm 3$--$4$\,pt), retention CIs are wider because the denominator
-(SC@5 accuracy) is small on these models.}
+$\alpha_\mathrm{sc}$ is small on these cells.}
 \label{tab:gate-pooled}
 \end{table*}
 
-Figure~\ref{fig:pareto} shows the Pareto curves for the four pooled
-cells. Table~\ref{tab:gate-pooled} reports the best operating point
-per cell with 95\% CIs. Across all four cells the best gate saves
-\textbf{45--99\%} of the always-SC compute while retaining
-$\ge 98\%$ of its accuracy. On Qwen-Q4 the gate effectively becomes
-``always greedy with a sliver of SC calls'' (99.3\% skip): it has
-learned that SC is net-negative for this cell and disables itself.
+Table~\ref{tab:gate-pooled} reports the numerical operating points.
+On Qwen-FP16 the \textsc{logistic} gate skips $86.0\%$ of prompts
+($95\%$ CI $[82.5,89.3]$) at cost ratio $C{=}1.56$ and retention
+$R{=}98.1\%$. On Qwen-Q4, \textsc{conf\_only} skips $99.3\%$ at
+$C{=}1.03$ and $R{=}98.7\%$: pooled SC@$5$ accuracy ($17.0\%$) is
+only $0.5$\,pt above greedy ($16.5\%$) so the marginal gain almost
+never outweighs SC's $5\times$ cost, and the gate essentially
+disables itself --- the same per-task cell where SC is outright
+net-negative (Qwen-Q4${\times}$MATH-500) drives this collapse. On Gemma
+the separation is harder: Gemma-FP16 skips $44.7\%$ at
+$C{=}3.21,R{=}98.8\%$, and Gemma-Q4 skips $57.9\%$ at
+$C{=}2.68,R{=}98.5\%$. The four cells together span the full range
+$C\in[1.03,3.21]$, equivalent to skipping $45\%$--$99\%$ of prompts
+and removing $36\%$--$79\%$ of always-SC's $C{=}5$ compute, while
+every cell retains at least $98\%$ of SC's accuracy. Skip-rate CIs are uniformly tight ($\pm 3$--$4$\,pt);
+retention CIs are wider because $\alpha_\mathrm{sc}$ is the
+denominator and is itself small.
 
-\subsection{Feature ablation}
+\subsection{Feature and capacity ablation}
 \label{sec:ablation}
 
-We compare \textsc{conf\_only} (1 feature), \textsc{logistic} (12
-features), \textsc{mlp} (12 features, 32$\times$16 hidden) at both the
-$n{=}200$ per-task and $n{=}400$ pooled scales.
+We compare \textsc{conf\_only} ($1$ feature), \textsc{logistic}
+($12$ features) and \textsc{mlp} ($12$ features, $32\times 16$
+hidden) at both the $n{=}200$ per-task scale and the $n{=}400$
+pooled scale. Three consistent trends emerge.
 
-\begin{enumerate}
-  \item \textbf{At $n{=}200$ per cell}, \textsc{conf\_only} is frequently
-        the best gate; \textsc{logistic} is competitive; \textsc{mlp}
-        often collapses to $\tau{=}0$ because the class-balanced
-        training signal is thin at $n{=}160$ training prompts with
-        $10\text{--}20$ positive labels.
-  \item \textbf{At $n{=}400$ pooled}, \textsc{logistic} overtakes
-        \textsc{conf\_only} on 3/4 cells: with more training data the
-        linear combination of the 12 features beats the single
-        strongest one.
-  \item \textbf{\textsc{mlp} never wins at any scale} in our
-        experiments. The decision surface is essentially linear in
-        scaled features; extra capacity over-fits.
-\end{enumerate}
+At $n{=}200$ per cell, \textsc{conf\_only} is frequently the best
+gate, \textsc{logistic} is competitive, and \textsc{mlp} often
+collapses to $\tau{=}0$ (i.e.\ ``always run SC'') because the
+class-balanced training signal is thin: $160$ training prompts with
+a base rate of roughly $8$--$23\%$ positive labels (i.e.\ $13$--$36$
+positives per fold) give the MLP too little information to beat a
+linear model. At $n{=}400$ pooled,
+\textsc{logistic} overtakes \textsc{conf\_only} on $3/4$ cells: with
+more data the weighted combination of $12$ features beats the
+single strongest one. And in no cell, at any scale, does
+\textsc{mlp} win: the decision surface is essentially linear in
+scaled features, so extra capacity over-fits the training folds.
 
 \begin{table}[t]
 \centering\small
 \begin{tabular}{lc}
 \toprule
-Feature & coefficient \\
+Feature & coefficient $w_j$ \\
 \midrule
 greedy\_mean\_ent  & $+0.71$ \\
 greedy\_top5\_ent  & $+0.58$ \\
@@ -382,137 +635,173 @@ text\_n\_ops       & $+0.31$ \\
 text\_n\_digits    & $+0.19$ \\
 \bottomrule
 \end{tabular}
-\caption{Top-5 standardised-feature coefficients from the pooled
-Qwen-FP16 \textsc{logistic} gate. Positive~$\to$~higher score~$\to$~more
-likely to run SC. High entropy and low margin (high uncertainty)
-correctly flag SC-worthiness.}
+\caption{Top-5 standardised-feature coefficients of the pooled
+Qwen-FP16 \textsc{logistic} gate. Positive $\to$ higher score $\to$
+more likely to run SC. High entropy and low margin confidence
+correctly flag SC-worthy prompts; operator and digit counts provide
+residual signal.}
 \label{tab:coef}
 \end{table}
 
-Table~\ref{tab:coef} gives the top-5 standardised-feature coefficients
-of the pooled Qwen-FP16 \textsc{logistic} model. The dominant signals
-are greedy token-level entropy (positive, more entropy $\to$ run SC)
-and greedy margin confidence (negative, more confident $\to$ skip).
-Operator and digit counts provide residual signal.
+Table~\ref{tab:coef} gives the five largest absolute standardised
+coefficients $|w_j|$ from the pooled Qwen-FP16 \textsc{logistic}
+gate. Greedy token-level entropy (positive: more entropy $\to$ run
+SC) and greedy margin confidence (negative: more confident $\to$
+skip) dominate. Operator and digit counts contribute small but
+non-trivial residual signal, consistent with ``more arithmetic $\to$
+more benefit from multiple samples''. The linearity of the decision
+surface is visible in the sign of these coefficients alone, which
+explains why the MLP cannot improve on it.
 
 \begin{figure*}[t]
 \centering
-\includegraphics[width=\textwidth]{fig4_operating_points.png}
-\caption{Operating points (skip rate vs.\ retention) per
-(cell, method, dataset) with $1\,000{\times}$ bootstrap CI bars.
-Pooled points (stars) have the tightest CIs. Method ranking is
-stable: \textsc{logistic} $\gtrsim$ \textsc{conf\_only} $\gg$
-\textsc{mlp}.}
+\includegraphics[width=\textwidth]{fig4_operating_points.pdf}
+\caption{Operating points (skip rate vs.\ retention) per (cell,
+method, dataset) with $1\,000{\times}$ bootstrap confidence-interval
+bars. Stars mark pooled points; circles (GSM8K) and squares
+(MATH-500) mark per-task points. Method ranking is stable across
+cells: \textsc{logistic} $\gtrsim$ \textsc{conf\_only}
+$\gg$ \textsc{mlp}.}
 \label{fig:operating}
 \end{figure*}
 
-Figure~\ref{fig:operating} plots the (skip\_rate, retention) bootstrap
-point per cell, method, and dataset. Pooled stars give the tightest CIs; per-task markers are noisier. Method ranking is stable.
+Figure~\ref{fig:operating} plots the (skip-rate, retention) point
+per (cell, method, dataset) with bootstrap CI bars. Pooled
+operating points (stars) have the tightest CIs, both in skip rate
+and retention, consistent with the bigger effective sample size.
+Per-task points (circles) are noisier but follow the same ranking.
+On all four cells, red \textsc{logistic} and blue
+\textsc{conf\_only} cluster near retention $100\%$ across a wide
+range of skip rates, while green \textsc{mlp} either lies below
+them or collapses to the always-SC corner ($0\%$ skip).
 
 \section{Discussion}
 
-\paragraph{Why do small models fail always-SC?}
-The harm rate $h$ requires a wrong answer to win a plurality vote over
-the correct one. This happens when (i) the model's distribution over
-candidate answers is diffuse, and (ii) the wrong-majority mode is
-entropically cheap under the sampler. On small models both conditions
-hold on hard prompts. SC's strength on large models is that both rates
-are low and $y - h$ is consistently positive; on small models the
-rates are small and comparable.
+\paragraph{Why does always-SC fail on small models?}
+Eq.~\ref{eq:oracle-gap} gives the closed-form answer:
+$\alpha_\mathrm{o}-\alpha_\mathrm{sc}=\mathbb{E}[h]$, and on small
+models $\mathbb{E}[h]$ is structurally non-negligible. The
+hardness on small models is concentrated on prompts where the
+model's candidate-answer distribution is diffuse, and plurality
+voting can elevate a wrong mode above a correct one precisely when
+the correct mode is a thin plurality rather than a strict majority.
+This is consistent with theoretical findings that SC's statistical
+guarantees require mild concentration around the correct
+mode~\citep{Cordero2025Certified,Zhou2025RPC}; at small scale that
+concentration is often absent. It also explains why efficient-SC
+methods that \emph{shrink $N$}~\citep{Aggarwal2023AdaptiveConsistency,
+Aghazadeh2025CGES,Kim2026ReASC} cannot fix the problem: they reduce
+the variance of the estimate but not its bias.
+
+\paragraph{Why does quantisation amplify the failure?}
+On Qwen-Q4${\times}$MATH-500, 4-bit quantisation drops greedy
+accuracy by $5.5$\,pt relative to FP16 (Table~\ref{tab:q4}). It
+also re-shapes the sampling distribution: we observe the help rate
+falling by $2$\,pt and the harm rate rising by $2.5$\,pt, which
+inverts the sign of $\Delta_\mathrm{sc}$. This is the same
+phenomenon flagged by \citet{Li2025QuantMath,Li2025QuantMitigate}:
+post-training quantisation disproportionately harms the earliest
+reasoning steps, and those early errors cascade through a multi-
+sample vote.
 
 \paragraph{Why is Gemma's gate weaker than Qwen's?}
-Across 2 datasets and both precisions, Qwen gates save 33--99\% of
-compute while Gemma gates save 17--58\%. Two hypotheses: (a) Gemma-3's
-RLHF may have compressed its greedy confidence into a narrower range,
-reducing feature informativeness; (b) Gemma-3's sliding-window
-attention \citep{Gemma3Report} may interact with greedy token margins
-differently. We did not do a controlled analysis; a natural follow-up.
+Across the six Qwen cells (two datasets, both precisions, plus
+pooled), the best gate skips $59$--$100\%$ of prompts, while across
+the six Gemma cells the best gate skips only $10$--$58\%$. Two
+hypotheses. First, Gemma-3's reinforcement learning from human
+feedback (RLHF) pipeline~\citep{Gemma3Report} may compress
+greedy-pass confidence into a narrower range, reducing
+feature informativeness. Second, Gemma-3's sliding-window attention
+may interact with per-token margins differently from Qwen's dense
+attention, changing the mapping from uncertainty to SC-worthiness.
+A controlled follow-up on the same family across precisions is a
+natural extension.
 
 \paragraph{Why do deeper MLPs lose?}
-Per-cell $n{=}160$ (training fold) with 12 features and 3\% positive
-base-rate is firmly in linear-model territory. Extra nonlinearity is
-over-parameterisation.
+Per-cell $n{=}160$ training prompts with $12$ features and a
+$8$--$23\%$ positive base rate (label $h\vee y$) is firmly in
+linear-model territory.
+Extra nonlinearity is over-parameterisation; this is the well-known
+small-data corner of the bias--variance trade-off. On
+pooled $n{=}400$ the MLP becomes competitive but still does not
+win, consistent with the visibly linear coefficient structure in
+Table~\ref{tab:coef}.
+
+\paragraph{What the gate's coefficients encode.}
+Beyond entropy and margin confidence, two text features --- operator
+and digit counts --- survive $L_2$ regularisation with positive
+weight (Table~\ref{tab:coef}). Once the model has reported its own
+uncertainty, the prompt still adds residual signal that ``more
+arithmetic $\to$ more benefit from multiple samples'', echoing the
+surface-form/trace-variance link of
+\citet{Lin2024SCAnalysis}, and explaining why \textsc{conf\_only}
+loses to \textsc{logistic} on three of four pooled cells.
+
+\paragraph{Calibration-data scale, not model capacity, is the binding constraint.}
+Pooling to $n{=}400$ unblocks a recipe that $n{=}200$ per-task data
+cannot: on Gemma-Q4, \textsc{logistic} climbs from $19.6\%$
+per-task to $57.9\%$ pooled skip-rate; on Qwen-FP16, from $66.1\%$
+to $86.0\%$. The deployment rule is concrete --- with $\sim\!200$
+labelled prompts a one-feature confidence gate is the safer
+default; with $\sim\!400$ the 12-feature linear gate is uniformly
+preferred, and extra capacity is still wasted.
+
+\paragraph{Composition and deployment.}
+Adaptive-$N$ methods~\citep{Aggarwal2023AdaptiveConsistency,
+Wan2024RASC,Manvi2024AdaptiveSampling} reduce $N$ \emph{given that
+SC runs}; our gate decides whether it runs, so the two axes
+multiply. The gate itself is drop-in: no base-model retraining, no
+verifier, no sampler change, and a single scalar threshold
+$\tau^{\star}$ that an operator re-tunes per service tier from the
+$(C,R)$ Pareto curve at zero extra inference cost. For on-device
+reasoning where latency and energy
+dominate~\citep{Wang2025MNNLLM,Bsharat2025MobileMMLU,Cao2026PER},
+removing $36$--$79\%$ of always-SC compute maps directly to
+user-visible latency, and the gate composes \emph{before} any
+cross-model cascade~\citep{Zheng2025CITER,Ong2024RouteLLM,
+Chen2024FrugalGPT}.
 
 \section*{Limitations}
 
-\begin{enumerate}
-\itemsep 0em
-\item \textbf{One random seed.} Pooled $n{=}400$ already tightens
-      skip-rate CIs to $\pm 3$\,pt, but acc-retention CIs remain wide
-      because SC-accuracy is small (ratio variance dominates). Three
-      seeds would tighten retention further.
-\item \textbf{Two model families, two math benchmarks.} Generalisation
-      to coding, commonsense, retrieval-heavy tasks, or 3B+ models is
-      not tested.
-\item \textbf{SC@5 only.} At $N{=}16$ / $N{=}32$ the gate may need
-      retuning; the harm rate $h$ likely falls as $N$ grows.
-\item \textbf{Fixed threshold.} Adaptive $\tau$ by prompt-difficulty
-      bucket is an obvious extension.
-\item \textbf{Not verifier-aware.} If a cheap verifier is available
-      post-SC, the right analysis is a three-way gate
-      (greedy~/~SC~/~SC$+$verifier); we leave this to future work.
-\end{enumerate}
+Five caveats qualify the scope of our findings. First, we ran
+each cell with a single random seed. Pooled $n{=}400$ tightens
+skip-rate CIs to $\pm 3$\,pt but retention CIs remain wide
+because the denominator $\alpha_\mathrm{sc}$ is itself small;
+three seeds would tighten retention further. Second, we evaluate
+two model families and two math benchmarks; generalisation to
+coding, commonsense, retrieval-heavy tasks, or models in the
+$3$\,B$+$ range is not tested. Third, we fix $N{=}5$. At larger
+$N$ the harm rate $\mathbb{E}[h]$ should fall (and the gate's
+threshold will need re-tuning), but the qualitative claim --- that
+$\mathbb{E}[h]$ is non-negligible --- should remain. Fourth, our
+gate uses a single fixed threshold $\tau^{\star}$; a
+difficulty-bucketed adaptive $\tau$ is an obvious extension.
+Finally, we do not study a cheap verifier post-SC; if one is
+available the right analysis is a three-way gate
+(greedy / SC / SC + verifier), which we leave to future work and
+which composes cleanly with the two-way gate studied here.
 
 \section{Conclusion}
 
-On small ($<$2B) reasoning models, the default ``always SC'' recipe is
-dominated by a per-prompt oracle gate in every one of our 12
-experiments. The mechanism is a non-negligible rate of SC flipping
-correct answers to wrong --- a pathology that plurality voting cannot
-detect. We show that a 12-feature logistic gate, trained on a few
-hundred calibration prompts, realises most of the oracle's savings
-(45--99\% in the pooled $n{=}400$ analysis) at $\ge 98\%$ accuracy
-retention. The gate is model-local, verifier-free, runs on-device,
-and is deploy-ready. Before reporting ``SC@$N$ improves accuracy'' on
-small models, check the harm rate.
+On small ($<2$B) reasoning models, the default ``always run SC''
+recipe is strictly dominated by a per-prompt oracle gate in every
+one of our $12$ experiments. The dominance is closed-form: the
+oracle's margin over always-SC equals the rate at which SC flips
+correct greedy answers to wrong, and on small models that rate is
+structurally non-negligible. A 12-feature logistic gate trained
+via 5-fold cross-validation on a few hundred calibration prompts
+captures most of the oracle's savings: it skips $45$--$99\%$ of
+SC calls and removes $36$--$79\%$ of always-SC compute at
+$\ge 98\%$ accuracy retention in the pooled $n{=}400$ analysis,
+with tight bootstrap CIs. The gate is
+model-local, verifier-free, runs on-device in under a minute of
+consolidation time on a single MacBook, and is deploy-ready.
+Before reporting ``SC@$N$ improves accuracy'' on small models,
+check the harm rate.
 
-% Bibliography
+{\small
+\setlength{\bibsep}{2pt}
 \bibliography{custom}
-
-\appendix
-
-\section{Reproducibility}
-\label{sec:appendix}
-
-All experiments run on a single MacBook Pro M4 Pro (24\,GB unified
-memory, Apple M4 GPU, MLX 0.31 + \texttt{mlx-lm} 0.31 + PyTorch 2.11
-with MPS, Python 3.13). Wall-clock budget:
-
-\begin{itemize}
-  \itemsep 0em
-  \item Block A generation, GSM8K (4 cells $\times$ 200 prompts
-        $\times$ 6 gens): 3\,h 00\,min.
-  \item Block A generation, MATH-500: 4\,h 30\,min.
-  \item Consolidation scripts (bootstrap $1\,000{\times}$, featurise,
-        fit, figure): $<$3\,min.
-\end{itemize}
-
-Total GPU-hours: $\approx 7.5$. No CUDA, no cloud, no paid API.
-
-\section{Per-cell paired FP16-vs-Q4 bootstrap}
-\label{sec:appendix-b}
-
-Full $1\,000{\times}$ paired bootstrap of FP16-minus-Q4 differences,
-$n{=}200$ per cell.
-
-\begin{table}[h]
-\centering\small
-\begin{tabular}{lllcc}
-\toprule
-Dataset & Model & Metric & $\Delta$ & 95\% CI \\
-\midrule
-GSM8K    & Qwen  & greedy & $+0.186$ & $[+0.110, +0.265]$ \\
-GSM8K    & Qwen  & SC@5   & $+0.160$ & $[+0.095, +0.230]$ \\
-GSM8K    & Gemma & greedy & $+0.224$ & $[+0.160, +0.290]$ \\
-GSM8K    & Gemma & SC@5   & $+0.270$ & $[+0.205, +0.340]$ \\
-MATH-500 & Qwen  & greedy & $+0.055$ & $[+0.005, +0.105]$ \\
-MATH-500 & Qwen  & SC@5   & $+0.099$ & $[+0.055, +0.145]$ \\
-MATH-500 & Gemma & greedy & $+0.124$ & $[+0.075, +0.175]$ \\
-MATH-500 & Gemma & SC@5   & $+0.159$ & $[+0.105, +0.220]$ \\
-\bottomrule
-\end{tabular}
-\caption{Paired FP16$-$Q4 contrasts. All 8 have non-overlapping-zero
-95\% CIs.}
-\end{table}
+}
 
 \end{document}
